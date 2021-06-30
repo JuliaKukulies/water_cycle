@@ -1,0 +1,369 @@
+''' This python module collects functions for the calculation of atmospheric water vapor transport and moisture divergence. '''
+
+# import libraries 
+import numpy as np 
+import xarray as xr
+import metpy
+from metpy import calc
+import scipy as sp
+import scipy.signal
+from scipy.signal import convolve
+from metpy.units import units
+
+############################# CONSTANTS##############################
+
+
+# assign unit to grid spacing
+Rad = 6371*1000
+# gravitational accelration 
+g = 9.8 
+# density of water in kg/m3 
+pw= 997
+# density for dry air 
+pd = 1.225 
+# specific gas constant for dry air 
+R = 287.058
+# constant for unit in mm per day 
+C= -1/(g*pw)
+c= -1/(g)
+
+
+############################# BASIC CALCULATIONS ##########################
+
+
+def find_nearest_idx(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return idx, array[idx]
+
+def geopotential_to_height(z):
+    """ This function converts geopotential heights to geometric heights. This approximation takes into account the varying gravitational force with heights, but neglects latitudinal vairations.
+    Parameters:
+    ------------
+    z(float) : (1D or multi-dimenstional) array with geopotential heights
+    Returns:
+    ----------
+    geometric_heights : array of same shape containing altitudes in metres
+    """
+    g = 9.80665 # standard gravity 
+    Re = 6.371 * 10**6  # earth radius
+    geometric_heights   = (z*Re) / (g * Re - z)
+    return geometric_heights 
+
+
+
+def colint_pressure(values,pressure_levels):
+    """ This function calculates the column-integrated water vapor
+    in kg/m2 from specific humidity (kg/kg) at different hpa levels.
+
+    """
+    return np.trapz(values, pressure_levels, axis = 0)* g
+
+
+
+def column_integration(values, z, ax = None ):
+    """This functions calculates the column-integrated value of a given atmospheric variable at different pressure levels
+    Parameters:
+    -----------
+    values(float): 1D or multi-dimensional array with values of atmospheric variable at different pressure levels
+    z(int): array with geopotential heights for values
+    axis = axis along which to integrated. The default is 0.
+    Returns:
+    --------
+    colint(float): array with column-integrated values of variable (dimension reduced by 1)
+    """
+    # convert geopotential to geometric heights in meters 
+    geometric_heights   = geopotential_to_height(z)
+
+    if ax == None:
+        ax = 0
+
+    # integration of column values
+    colint = np.trapz(values, x= geometric_heights, axis =ax )
+
+    return colint
+
+
+def total_integrated_moisture_flx(qu, qv):
+    """
+    Returns 2D field with total column-integrated water vapour flux, given: 
+
+    qu: 2D field with column-integrated moisture flux u -component 
+    qv: 2D field with column-integrated moisture flux v -component    
+
+    """
+    return np.sqrt(qu **2 + qv **2)
+
+
+
+
+
+
+############################## MOISTURE DIVERGENCE##############################################
+
+def get_spacing(lats, lons):
+    '''This functions calculates the grid spacing in meter.
+
+
+    Args:
+    lats(numpy array): 1D array with latitudes
+    lons(numpy array): 1D array with longitudes
+
+
+    Returns:
+    dlat(numpy array): latitude spacings in m 
+    dlon(numpy array): longitude spacings in m 
+
+'''
+
+    # creating 2D fields for lats and lons 
+    latitudes = np.stack([lats]*np.shape(lons)[0], axis = 1)
+    longitudes = np.stack([lons]*np.shape(lats)[0], axis = 0)
+
+    # convert lats and lons to cartesian coordinates 
+    x = Rad * np.cos(np.radians(latitudes)) * np.cos(np.radians(longitudes))
+    y = Rad * np.cos(np.radians(latitudes)) * np.sin(np.radians(longitudes))
+    z = Rad *np.sin(np.radians(latitudes))
+
+    # stack to get 3D array 
+    cartesian = np.stack([x, y, z], axis = 2)
+    # pythagorean theorem to get distances in meter
+    dlat = np.sqrt(np.sum((cartesian[2:, :] - cartesian[:-2,:]) ** 2, axis=-1))
+    dlon = np.sqrt(np.sum((cartesian[:, 2:] - cartesian[:,:-2]) ** 2, axis=-1))
+
+    return dlat, dlon
+
+
+def get_delta(lats, Rad):
+    ## grid spacings 
+    dx = 2*np.pi*Rad * (0.25/360)
+    # latitude dependent 
+    dy = 2*np.pi*Rad *(0.25/360) * np.cos(np.nanmean(lats))*(-1)
+    dx = dx * units.meters
+    dy = dy * units.meters
+
+    return dx, dy 
+
+
+def derivative_u(quint,dlon):
+    """
+
+    This function calculates the derivative in v direction in the spectral space using FFT.
+
+
+    Args:
+
+    quint(np.array): 2D field of integrated water vapor flux in u direction 
+    dlon(np.array): 2D field of longitude spacings (accounting for different distances dependent on latitude)
+
+    Returns:
+
+    2D field with first derivative of vertically integrated water vapor flux in u direction 
+
+    """
+    quint_padded = np.hstack([np.fliplr(quint[:-1, :-1]), quint[:-1, :-1], np.fliplr(quint[:-1, :-1])]) 
+    f_quint = np.fft.fft(quint_padded, axis=1)
+
+    m, n = f_quint.shape
+    m2 = m // 2
+    n2 = n // 2
+        
+    f_lon = (2.0 * np.pi * np.fft.fftfreq(n, d= dlon[:-1,[0]]/2) )
+    f_lon[:, n2] = 0.0
+    #f_lon = np.broadcast_to(f_lon.reshape(1, -1), (m, n)) 
+    
+    df_quint_dx = f_quint.copy() * 1j * f_lon 
+    
+    d_n = 50
+    df_quint_dx[:, n2 - d_n : n2 + d_n + 1] *= 0.0
+    
+    real = np.fft.ifft(df_quint_dx, axis = 1).real
+
+    return real[ :, quint[:-1, :-1].shape[1]: quint[:-1, :-1].shape[1] * 2]
+
+
+
+
+
+def derivative_v(qvint,dlat):
+    """
+
+    This function calculates the derivative in v direction in the spectral space using FFT.
+
+
+    Args:
+
+    qvint(np.array): 2D field of integrated water vapor flux in v direction 
+    dlat(np.array): 2D field of latitude spacings 
+
+    Returns:
+
+    2D field with first derivative of vertically integrated water vapor flux in v direction 
+
+    """
+    qvint_padded = np.vstack([np.flipud(qvint[:-1, :-1]), qvint[:-1, :-1], np.flipud(qvint[:-1, :-1])]) 
+    f_qvint = np.fft.fft(qvint_padded, axis=0)
+
+    m, n = f_qvint.shape
+    m2 = m // 2
+    n2 = n // 2
+        
+    f_lat = 2.0 * np.pi * np.fft.fftfreq(m, d= dlat[0,0]/2)
+    f_lat[m2] = 0.0
+    f_lat = np.broadcast_to(f_lat.reshape(-1, 1), (m, n)) 
+    
+    df_qvint_dy = f_qvint.copy() * -1j * f_lat
+    
+    d_m = 60
+    df_qvint_dy[m2 - d_m : m2 + d_m + 1, :] *= 0.0
+    real = np.fft.ifft(df_qvint_dy, axis = 0).real
+
+    return real[qvint[:-1, :-1].shape[0]: qvint[:-1, :-1].shape[0] * 2, :]
+
+
+def dy_dlat(y, dlat):
+    '''This functions calculates the derivative along latitudes of a variable y using a finite differential method.
+
+    Args:
+    y(numpy array): atmospheric variable, e.g. u, v, q, qu, qv and so on
+    dlat(np.array): grid spacing in meter, should be more or less constant'''
+
+    k_lat = np.array([[-1], [0], [1]])
+    result = convolve(y, k_lat, mode="valid") / dlat
+    return result 
+
+
+def dy_dlon(y, dlon):
+    '''This functions calculates the derivative along longitudes of a variable y using a finite differential method.
+
+    Args:
+    y(numpy array): atmospheric variable, e.g. u, v, q, qu, qv and so on
+    dlon(np.array): grid spacing in meter, should be varying dependent on latitude '''
+    k_lon= np.array([[1, 0, -1]])
+    result = convolve(y, k_lon, mode="valid") / dlon
+    return result
+
+
+
+
+def get_surface_values(field, nlat, nlon,nlev, surface_pressures,pressure_levels):
+    """
+    This function reduces a 3D meteorological field to two dimensions given the surface pressures. 
+
+    Args:
+    field(numpy array): 3 dimensionsal field of meteorological variable
+    nlat(int): number of latitudes (2nd dimension)
+    nlon(int): number of longitudes (3rd dimension)
+    nlev(int): number of levels (1st dimension )
+    surface_pressures(numpy array): 2D field with surface pressure values, must have same latitude and longitudes as field
+    pressure_levels(numpy array): 1D array with pressure levels of field variable 
+
+
+    Returns: 2D array with values at surface 
+    """
+    for lat in np.arange(nlat):
+        for lon in np.arange(nlon):
+            idx,pr = find_nearest_idx(pressure_levels,surface_pressures[lat,lon])
+            field[np.arange(nlev)!=idx,lat,lon] = 0
+            
+    return np.nansum(field,axis = 0 )
+
+
+
+
+def divergence(data,qu,qv):
+    """
+
+    This function calculates the divergence of a given flux.
+
+    Args:
+    data: xarray dataset containing coordinate references 
+    qu: u-component of 2D flux field (e.g. moisture flux)
+    qv: v-component of 2D flux field 
+
+    Returns: 2D field with divergence of the flux. 
+    
+    """
+    import wrf
+    dlat, dlon = atm.get_spacing(data.latitude.values, data.longitude.values)
+    udiff= atm.derivative_u(qu, dlon)
+    vdiff= atm.derivative_v(qv, dlat)
+    conv_total = (udiff + vdiff)
+
+    return wrf.smooth2d(-(vdiff + udiff)*86400 , passes = 3)
+
+
+
+def correct_column_integration(data, sp, q, u, v, u10, v10):
+    """
+
+    This function performs an interpolation and extrapolation before 
+    the vertical column integration over pressure coordinates. Humidity 
+    values are interpolated onto the surface pressure field (extrapolated 
+    when surface pressure is higher
+    than the lowest pressure level in the model). 
+
+    Args: 
+    data: xarray dataset with data and coordinate references
+    sp: 2D field with corresponding surafce pressures
+    q: humidity field on pressure levels  
+    u: u wind field on pressure levels 
+    v: v wind field on pressure levels 
+
+    u10: 2D field with surface wind u-component
+    v10: 2D field with surface wind v-component
+
+    Returns: 
+    colint: total column water vapour 
+    qu: vertically integrated moisture eastward flux 
+    qv: vertically integrated moisture northward flux 
+
+
+    """
+    from scipy import interpolate
+    import wrf 
+    
+    coords = np.where(sp < 10000)
+    pressure = np.zeros((q.shape))
+    # get humidity value for surface pressures 
+    surface_humidity = wrf.interplevel(q, pressure, sp)
+
+    for i, ilat in enumerate(coords[0]):
+        ilon = coords[1][i]
+        sp_value = sp[ilat,ilon]
+
+        pressure[:,ilat,ilon]= data.level.values
+        pressure[36] =  sp
+        idx, pl = atm.find_nearest_idx(data.level.values, sp_value)
+
+        # function for extrapolation/ interpolation: 
+        x_vals = data.level.values
+        y_vals= q[:,ilat,ilon]
+        f = interpolate.interp1d(x_vals, y_vals, fill_value = "extrapolate", kind = 'cubic')
+
+        # set q value below ground to 0 
+        if sp_value < 1000:
+            if sp_value > pl:
+                idx = idx + 1  
+            q[idx, ilat,ilon] = surface_humidity[ilat,ilon]
+            u[idx, ilat,ilon] = u10[ilat,ilon]
+            v[idx, ilat,ilon] = v10[ilat,ilon]
+            pressure[idx, ilat,ilon] = sp_value
+            q[idx:37, ilat, ilon] =  0
+
+        if sp_value > 1000:
+            q[36, ilat, ilon] = f(sp_value)
+            u[36, ilat, ilon ] = u10[ilat,ilon]
+            v[36, ilat, ilon ] = v10[ilat,ilon]
+
+    colint = atm.colint_pressure(q, pressure)
+    qu = atm.colint_pressure(q*u, pressure)
+    qv= atm.colint_pressure(q*v, pressure)
+    
+    return colint, qu, qv 
+
+
+
+
+
+
