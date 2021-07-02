@@ -27,6 +27,14 @@ R = 287.058
 C= -1/(g*pw)
 c= -1/(g)
 
+# gas constant for water vapour in J K-1 kg-1
+Rvap= 461
+# constants for Tetens formula (for saturation over water)
+c1= 611.21
+c2= 17.502
+c3= 32.19
+# freezing point
+T0 = 273.16 
 
 ############################# BASIC CALCULATIONS ##########################
 
@@ -50,6 +58,23 @@ def geopotential_to_height(z):
     geometric_heights   = (z*Re) / (g * Re - z)
     return geometric_heights 
 
+
+
+def get_surface_humidity(temperature, spressure):
+    """
+
+    This functions computes the near-surface humidity for ERA5 data, given the dew point temperature and surface pressure.
+
+    Args:
+    temperature: 2D field of 2m dew point temperature
+    spressure: 2D fields of surface pressure 
+
+    Returns:
+    q_sat: 2D near-surface specific humidity (kg/kg)
+    """
+    e_sat = c1* np.exp( c2 * ((temperature - T0)/ (temperature - c3)))
+    q_sat = ((R / Rvap) * e_sat ) / (spressure - (1- R/Rvap) * e_sat )
+    return q_sat
 
 
 def colint_pressure(values,pressure_levels):
@@ -96,7 +121,25 @@ def total_integrated_moisture_flx(qu, qv):
 
 
 
+def weighted_mean(arr, data):
+    """
 
+    This function calculates the area-weighted mean over a 2D field. 
+    
+    Args: 
+    arr: 2D array with variable that should be averaged
+    data: xarray with latitude and longitude coordinates
+
+    Returns: 
+    weighted_mean: scalar that is the weighted mean over the area
+
+    """
+    dataset=xr.DataArray(arr,  dims= {'latitude':data.latitude[:-1].values, 'longitude':data.longitude[:-1].values})
+    weights = np.cos(np.deg2rad(data.latitude[:-1]))
+    weights.name = "weights"
+    data_weighted = dataset.weighted(weights)
+    weighted_mean = data_weighted.mean(("latitude", "longitude"), skipna= True)
+    return weighted_mean.values
 
 
 ############################## MOISTURE DIVERGENCE##############################################
@@ -285,9 +328,9 @@ def divergence(data,qu,qv):
     
     """
     import wrf
-    dlat, dlon = atm.get_spacing(data.latitude.values, data.longitude.values)
-    udiff= atm.derivative_u(qu, dlon)
-    vdiff= atm.derivative_v(qv, dlat)
+    dlat, dlon = get_spacing(data.latitude.values, data.longitude.values)
+    udiff= derivative_u(qu, dlon)
+    vdiff= derivative_v(qv, dlat)
     conv_total = (udiff + vdiff)
 
     return wrf.smooth2d(-(vdiff + udiff)*86400 , passes = 3)
@@ -334,7 +377,7 @@ def correct_column_integration(data, sp, q, u, v, u10, v10):
 
         pressure[:,ilat,ilon]= data.level.values
         pressure[36] =  sp
-        idx, pl = atm.find_nearest_idx(data.level.values, sp_value)
+        idx, pl = find_nearest_idx(data.level.values, sp_value)
 
         # function for extrapolation/ interpolation: 
         x_vals = data.level.values
@@ -356,9 +399,9 @@ def correct_column_integration(data, sp, q, u, v, u10, v10):
             u[36, ilat, ilon ] = u10[ilat,ilon]
             v[36, ilat, ilon ] = v10[ilat,ilon]
 
-    colint = atm.colint_pressure(q, pressure)
-    qu = atm.colint_pressure(q*u, pressure)
-    qv= atm.colint_pressure(q*v, pressure)
+    colint = colint_pressure(q, pressure)
+    qu = colint_pressure(q*u, pressure)
+    qv= colint_pressure(q*v, pressure)
     
     return colint, qu, qv 
 
